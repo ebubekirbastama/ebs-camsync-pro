@@ -11,7 +11,9 @@ REQUIRED_PACKAGES = {
     "win10toast": "win10toast",
     "pystray": "pystray",
     "PIL": "Pillow",
-    "qrcode": "qrcode[pil]"
+    "qrcode": "qrcode[pil]",
+    "sounddevice": "sounddevice",
+    "numpy": "numpy"
 }
 
 def fix_setuptools():
@@ -69,11 +71,19 @@ from win10toast import ToastNotifier
 from PIL import Image, ImageDraw
 import pystray
 import qrcode
+import io
+import queue
+import numpy as np
+import sounddevice as sd
 
 
 PORT = 9999
+AUDIO_PORT = 10001
+VIDEO_PORT = 10002
 SAVE_DIR = "Gelen_Resimler"
 RULE_NAME = "EBS_Kamera_Sync_Rule"
+AUDIO_RULE_NAME = "EBS_CamSync_Audio_UDP"
+VIDEO_RULE_NAME = "EBS_CamSync_Video_UDP"
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 toaster = ToastNotifier()
@@ -111,10 +121,9 @@ def hide_console():
         ctypes.windll.user32.ShowWindow(whnd, 0)
 
 
-def check_and_open_firewall(log_callback):
-    log_callback("[i] Windows Güvenlik Duvarı kontrol ediliyor...\n")
+def add_firewall_rule(rule_name, protocol, port, log_callback):
     try:
-        check_cmd = f'netsh advfirewall firewall show rule name="{RULE_NAME}"'
+        check_cmd = f'netsh advfirewall firewall show rule name="{rule_name}"'
         result = subprocess.run(
             check_cmd,
             stdout=subprocess.PIPE,
@@ -128,15 +137,21 @@ def check_and_open_firewall(log_callback):
             or "eşleşen kural yok" in result.stdout.lower()
             or result.returncode != 0
         ):
-            log_callback(f"[+] {PORT} portu için kural ekleniyor...\n")
-            add_cmd = f'netsh advfirewall firewall add rule name="{RULE_NAME}" dir=in action=allow protocol=TCP localport={PORT}'
+            log_callback(f"[+] {protocol} {port} portu için güvenlik duvarı kuralı ekleniyor...\n")
+            add_cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=allow protocol={protocol} localport={port}'
             subprocess.run(add_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            log_callback("[✓] Güvenlik duvarı izni otomatik açıldı!\n")
+            log_callback(f"[✓] {protocol} {port} izni açıldı.\n")
         else:
-            log_callback("[✓] Güvenlik duvarı izni zaten mevcut.\n")
-
+            log_callback(f"[✓] {protocol} {port} güvenlik duvarı izni zaten mevcut.\n")
     except Exception as e:
-        log_callback(f"[X] Güvenlik duvarı ayarlanırken hata: {e}\n")
+        log_callback(f"[X] Güvenlik duvarı kuralı eklenemedi ({protocol} {port}): {e}\n")
+
+
+def check_and_open_firewall(log_callback):
+    log_callback("[i] Windows Güvenlik Duvarı kontrol ediliyor...\n")
+    add_firewall_rule(RULE_NAME, "TCP", PORT, log_callback)
+    add_firewall_rule(AUDIO_RULE_NAME, "UDP", AUDIO_PORT, log_callback)
+    add_firewall_rule(VIDEO_RULE_NAME, "UDP", VIDEO_PORT, log_callback)
 
 
 def get_local_ip():
@@ -180,11 +195,17 @@ class EbsSyncGui(ctk.CTk):
         self.connection_payload = f"ebs-sync://{self.local_ip}:{PORT}"
         self.server_running = False
         self.tray_icon = None
+        self.video_running = False
+        self.audio_running = False
+        self.last_video_frame_time = 0
+        self.video_frame_count = 0
+        self.audio_packet_count = 0
+        self.current_ctk_video_image = None
 
         self.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        self.grid_rowconfigure(6, weight=1)
 
         self.create_widgets()
 
@@ -201,7 +222,7 @@ class EbsSyncGui(ctk.CTk):
 
         self.subtitle_label = ctk.CTkLabel(
             self,
-            text="Mobil Cihaz Fotoğraf Otomasyon Yönetim Paneli",
+            text="Mobil Cihaz Fotoğraf / Video / Canlı Görüşme Yönetim Paneli",
             font=ctk.CTkFont(size=13),
             text_color=TEXT_MUTED
         )
@@ -288,8 +309,56 @@ class EbsSyncGui(ctk.CTk):
         )
         self.qr_payload_label.grid(row=2, column=1, padx=(0, 18), pady=(4, 18), sticky="w")
 
+        self.live_frame = ctk.CTkFrame(
+            self,
+            fg_color=CARD_BG,
+            corner_radius=15,
+            border_width=1,
+            border_color="#373D4B"
+        )
+        self.live_frame.grid(row=4, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.live_frame.grid_columnconfigure(1, weight=1)
+
+        self.video_box = ctk.CTkLabel(
+            self.live_frame,
+            text="CANLI\nGÖRÜNTÜ\nBEKLENİYOR",
+            width=320,
+            height=240,
+            fg_color="#0D111A",
+            corner_radius=12,
+            text_color=TEXT_MUTED,
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.video_box.grid(row=0, column=0, rowspan=3, padx=18, pady=18, sticky="w")
+
+        self.live_title = ctk.CTkLabel(
+            self.live_frame,
+            text="CANLI VİDEOLU GÖRÜŞME MODÜLÜ",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=NEON_BLUE
+        )
+        self.live_title.grid(row=0, column=1, padx=(0, 18), pady=(18, 2), sticky="w")
+
+        self.live_desc = ctk.CTkLabel(
+            self.live_frame,
+            text=f"APK canlı görüşme başlatınca video UDP {VIDEO_PORT}, ses UDP {AUDIO_PORT} üzerinden bu panele düşer.",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_MUTED,
+            wraplength=520,
+            justify="left"
+        )
+        self.live_desc.grid(row=1, column=1, padx=(0, 18), pady=2, sticky="w")
+
+        self.live_status = ctk.CTkLabel(
+            self.live_frame,
+            text="Durum: Bekleniyor",
+            font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+            text_color="white"
+        )
+        self.live_status.grid(row=2, column=1, padx=(0, 18), pady=(4, 18), sticky="w")
+
         self.log_header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.log_header_frame.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="ew")
+        self.log_header_frame.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="ew")
         self.log_header_frame.grid_columnconfigure(0, weight=1)
 
         self.log_label = ctk.CTkLabel(
@@ -337,7 +406,7 @@ class EbsSyncGui(ctk.CTk):
             text_color="#E0E6ED",
             corner_radius=10
         )
-        self.log_view.grid(row=5, column=0, padx=20, pady=(5, 15), sticky="nsew")
+        self.log_view.grid(row=6, column=0, padx=20, pady=(5, 15), sticky="nsew")
 
         self.progress_bar = ctk.CTkProgressBar(
             self,
@@ -345,7 +414,7 @@ class EbsSyncGui(ctk.CTk):
             fg_color="#131722",
             height=10
         )
-        self.progress_bar.grid(row=6, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.progress_bar.grid(row=7, column=0, padx=20, pady=(0, 10), sticky="ew")
         self.progress_bar.set(0)
 
         self.footer_label = ctk.CTkLabel(
@@ -354,7 +423,117 @@ class EbsSyncGui(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=TEXT_MUTED
         )
-        self.footer_label.grid(row=7, column=0, padx=25, pady=(0, 15), sticky="w")
+        self.footer_label.grid(row=8, column=0, padx=25, pady=(0, 15), sticky="w")
+
+
+    def parse_udp_payload(self, data, marker):
+        try:
+            if not data.startswith(marker):
+                return None
+            pipe_count = 0
+            cut_index = -1
+            for i, b in enumerate(data):
+                if b == 124:
+                    pipe_count += 1
+                    if marker == b"EBSVID1|" and pipe_count == 3:
+                        cut_index = i + 1
+                        break
+                    if marker == b"EBSAUD1|" and pipe_count == 2:
+                        cut_index = i + 1
+                        break
+            if cut_index <= 0:
+                return None
+            return data[cut_index:]
+        except Exception:
+            return None
+
+    def start_live_receivers(self):
+        if not self.video_running:
+            self.video_running = True
+            threading.Thread(target=self.video_udp_receiver, daemon=True).start()
+        if not self.audio_running:
+            self.audio_running = True
+            threading.Thread(target=self.audio_udp_receiver, daemon=True).start()
+
+    def video_udp_receiver(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", VIDEO_PORT))
+            self.write_log(f"[✓] Canlı video UDP dinleyici aktif. Port: {VIDEO_PORT}\n")
+
+            while True:
+                data, addr = sock.recvfrom(65535)
+                jpeg_data = self.parse_udp_payload(data, b"EBSVID1|")
+                if not jpeg_data:
+                    continue
+
+                self.video_frame_count += 1
+                self.last_video_frame_time = time.time()
+
+                try:
+                    img = Image.open(io.BytesIO(jpeg_data)).convert("RGB")
+                    img.thumbnail((320, 240), Image.Resampling.LANCZOS)
+                    canvas = Image.new("RGB", (320, 240), "#0D111A")
+                    x = (320 - img.width) // 2
+                    y = (240 - img.height) // 2
+                    canvas.paste(img, (x, y))
+                    self.after(0, lambda im=canvas, ip=addr[0]: self.update_video_frame(im, ip))
+                except Exception as e:
+                    self.write_log(f"[X] Video frame çözülemedi: {e}\n")
+        except Exception as e:
+            self.write_log(f"[X] Canlı video dinleyici başlatılamadı: {e}\n")
+            self.video_running = False
+
+    def audio_udp_receiver(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", AUDIO_PORT))
+            self.write_log(f"[✓] Canlı ses UDP dinleyici aktif. Port: {AUDIO_PORT}\n")
+
+            try:
+                stream = sd.RawOutputStream(
+                    samplerate=16000,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=1024,
+                    latency="low"
+                )
+                stream.start()
+            except Exception as e:
+                self.write_log(f"[X] Ses çıkışı açılamadı: {e}\n")
+                stream = None
+
+            while True:
+                data, addr = sock.recvfrom(4096)
+                audio_data = self.parse_udp_payload(data, b"EBSAUD1|")
+                if not audio_data:
+                    continue
+                self.audio_packet_count += 1
+                if stream:
+                    try:
+                        stream.write(audio_data)
+                    except Exception:
+                        pass
+                if self.audio_packet_count % 80 == 0:
+                    self.after(0, lambda ip=addr[0]: self.live_status.configure(
+                        text=f"Durum: Canlı bağlantı var | APK: {ip} | Video frame: {self.video_frame_count} | Ses paket: {self.audio_packet_count}"
+                    ))
+        except Exception as e:
+            self.write_log(f"[X] Canlı ses dinleyici başlatılamadı: {e}\n")
+            self.audio_running = False
+
+    def update_video_frame(self, pil_image, ip):
+        self.current_ctk_video_image = ctk.CTkImage(
+            light_image=pil_image,
+            dark_image=pil_image,
+            size=(320, 240)
+        )
+        self.video_box.configure(text="", image=self.current_ctk_video_image)
+        self.live_status.configure(
+            text=f"Durum: Canlı video alınıyor | APK: {ip} | Frame: {self.video_frame_count} | Ses paket: {self.audio_packet_count}"
+        )
 
     def create_qr_image(self, data):
         qr = qrcode.QRCode(
@@ -449,6 +628,7 @@ class EbsSyncGui(ctk.CTk):
 
     def init_backend_services(self):
         check_and_open_firewall(self.write_log)
+        self.start_live_receivers()
         threading.Thread(target=self.start_socket_server, daemon=True).start()
 
     def start_socket_server(self):
@@ -468,7 +648,7 @@ class EbsSyncGui(ctk.CTk):
 
             self.write_log(f"[✓] TCP Sunucu aktif edildi. Port: {PORT}\n")
             self.write_log(f"[i] APK QR bağlantı kodu: {self.connection_payload}\n")
-            self.write_log("[i] Telefonda APK'yı açıp QR kodu okutarak veya IP adresini girerek fotoğrafları yollayabilirsiniz.\n")
+            self.write_log("[i] Telefonda APK'yı açıp QR kodu okutarak veya IP adresini girerek medya dosyalarını yollayabilir veya canlı görüşme başlatabilirsiniz.\n")
             self.write_log("-" * 65 + "\n")
 
             try:
@@ -552,7 +732,7 @@ class EbsSyncGui(ctk.CTk):
                 try:
                     toaster.show_toast(
                         "EBS Ultra Sync",
-                        f"Yeni Fotoğraf Geldi:\n{file_name}",
+                        f"Yeni Medya Geldi:\n{file_name}",
                         duration=3,
                         threaded=True
                     )
