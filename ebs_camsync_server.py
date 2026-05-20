@@ -10,15 +10,45 @@ REQUIRED_PACKAGES = {
     "customtkinter": "customtkinter",
     "win10toast": "win10toast",
     "pystray": "pystray",
-    "PIL": "Pillow"
+    "PIL": "Pillow",
+    "qrcode": "qrcode[pil]"
 }
 
+def fix_setuptools():
+    try:
+        import pkg_resources
+    except:
+        print("[i] pkg_resources eksik. setuptools düzeltiliyor...")
+
+        try:
+            subprocess.check_call([
+                sys.executable,
+                "-m",
+                "pip",
+                "uninstall",
+                "setuptools",
+                "-y"
+            ])
+        except:
+            pass
+
+        subprocess.check_call([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "setuptools==69.5.1"
+        ])
+
 def install_missing_packages():
+    fix_setuptools()
+
     for import_name, pip_name in REQUIRED_PACKAGES.items():
         try:
             __import__(import_name)
         except ImportError:
             print(f"[i] Eksik paket yükleniyor: {pip_name}")
+
             subprocess.check_call([
                 sys.executable,
                 "-m",
@@ -38,6 +68,7 @@ import customtkinter as ctk
 from win10toast import ToastNotifier
 from PIL import Image, ImageDraw
 import pystray
+import qrcode
 
 
 PORT = 9999
@@ -141,18 +172,19 @@ class EbsSyncGui(ctk.CTk):
         ctk.set_appearance_mode("dark")
 
         self.title("EBS Ultra Sync - PC Server Panel")
-        self.geometry("750x620")
-        self.minsize(700, 550)
+        self.geometry("900x720")
+        self.minsize(820, 650)
         self.configure(fg_color=DARK_METAL)
 
         self.local_ip = get_local_ip()
+        self.connection_payload = f"ebs-sync://{self.local_ip}:{PORT}"
         self.server_running = False
         self.tray_icon = None
 
         self.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
         self.create_widgets()
 
@@ -211,8 +243,53 @@ class EbsSyncGui(ctk.CTk):
         )
         self.status_badge.pack(anchor="center", pady=5)
 
+        self.qr_frame = ctk.CTkFrame(
+            self,
+            fg_color=CARD_BG,
+            corner_radius=15,
+            border_width=1,
+            border_color="#373D4B"
+        )
+        self.qr_frame.grid(row=3, column=0, padx=20, pady=(5, 10), sticky="ew")
+        self.qr_frame.grid_columnconfigure(1, weight=1)
+
+        self.qr_image = self.create_qr_image(self.connection_payload)
+
+        self.qr_label = ctk.CTkLabel(
+            self.qr_frame,
+            text="",
+            image=self.qr_image
+        )
+        self.qr_label.grid(row=0, column=0, rowspan=3, padx=18, pady=18, sticky="w")
+
+        self.qr_title = ctk.CTkLabel(
+            self.qr_frame,
+            text="APK HIZLI BAĞLANTI QR KODU",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=NEON_BLUE
+        )
+        self.qr_title.grid(row=0, column=1, padx=(0, 18), pady=(18, 2), sticky="w")
+
+        self.qr_desc = ctk.CTkLabel(
+            self.qr_frame,
+            text="Telefondaki APK kamerayla bu QR kodu okuyunca IP ve port bilgisini otomatik alabilir.",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_MUTED,
+            wraplength=620,
+            justify="left"
+        )
+        self.qr_desc.grid(row=1, column=1, padx=(0, 18), pady=2, sticky="w")
+
+        self.qr_payload_label = ctk.CTkLabel(
+            self.qr_frame,
+            text=self.connection_payload,
+            font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+            text_color="white"
+        )
+        self.qr_payload_label.grid(row=2, column=1, padx=(0, 18), pady=(4, 18), sticky="w")
+
         self.log_header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.log_header_frame.grid(row=3, column=0, padx=20, pady=(15, 0), sticky="ew")
+        self.log_header_frame.grid(row=4, column=0, padx=20, pady=(10, 0), sticky="ew")
         self.log_header_frame.grid_columnconfigure(0, weight=1)
 
         self.log_label = ctk.CTkLabel(
@@ -260,7 +337,7 @@ class EbsSyncGui(ctk.CTk):
             text_color="#E0E6ED",
             corner_radius=10
         )
-        self.log_view.grid(row=4, column=0, padx=20, pady=(5, 15), sticky="nsew")
+        self.log_view.grid(row=5, column=0, padx=20, pady=(5, 15), sticky="nsew")
 
         self.progress_bar = ctk.CTkProgressBar(
             self,
@@ -268,7 +345,7 @@ class EbsSyncGui(ctk.CTk):
             fg_color="#131722",
             height=10
         )
-        self.progress_bar.grid(row=5, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.progress_bar.grid(row=6, column=0, padx=20, pady=(0, 10), sticky="ew")
         self.progress_bar.set(0)
 
         self.footer_label = ctk.CTkLabel(
@@ -277,7 +354,28 @@ class EbsSyncGui(ctk.CTk):
             font=ctk.CTkFont(size=12),
             text_color=TEXT_MUTED
         )
-        self.footer_label.grid(row=6, column=0, padx=25, pady=(0, 15), sticky="w")
+        self.footer_label.grid(row=7, column=0, padx=25, pady=(0, 15), sticky="w")
+
+    def create_qr_image(self, data):
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=2
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+
+        img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        img = img.resize((150, 150), Image.Resampling.LANCZOS)
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
+
+    def refresh_qr_code(self):
+        self.local_ip = get_local_ip()
+        self.connection_payload = f"ebs-sync://{self.local_ip}:{PORT}"
+        self.qr_image = self.create_qr_image(self.connection_payload)
+        self.qr_label.configure(image=self.qr_image)
+        self.qr_payload_label.configure(text=self.connection_payload)
 
     def create_info_box(self, parent, title, value, col):
         frame = ctk.CTkFrame(parent, fg_color="#1A1E29", corner_radius=10)
@@ -369,7 +467,8 @@ class EbsSyncGui(ctk.CTk):
             ))
 
             self.write_log(f"[✓] TCP Sunucu aktif edildi. Port: {PORT}\n")
-            self.write_log("[i] Telefonda APK'yı açıp bu PC'nin IP adresini girerek fotoğrafları yollayabilirsiniz.\n")
+            self.write_log(f"[i] APK QR bağlantı kodu: {self.connection_payload}\n")
+            self.write_log("[i] Telefonda APK'yı açıp QR kodu okutarak veya IP adresini girerek fotoğrafları yollayabilirsiniz.\n")
             self.write_log("-" * 65 + "\n")
 
             try:
@@ -425,6 +524,9 @@ class EbsSyncGui(ctk.CTk):
             conn.sendall(b"OK")
 
             save_path = os.path.join(SAVE_DIR, file_name)
+
+            # Klasör yoksa otomatik oluştur
+            os.makedirs(SAVE_DIR, exist_ok=True)
 
             if os.path.exists(save_path):
                 base, ext = os.path.splitext(file_name)
